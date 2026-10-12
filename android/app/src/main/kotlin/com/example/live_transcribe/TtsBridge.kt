@@ -2,6 +2,8 @@ package com.example.live_transcribe
 
 import android.content.Context
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import io.flutter.plugin.common.BinaryMessenger
@@ -16,6 +18,12 @@ import java.util.Locale
 class TtsBridge(messenger: BinaryMessenger, context: Context) {
 
     private val channel = MethodChannel(messenger, "live_transcribe/tts")
+
+    // The engine reports progress on its own thread, and a MethodChannel may
+    // only be used from the main one. Every message goes through here.
+    private val main = Handler(Looper.getMainLooper())
+
+    private var released = false
 
     // Set once the engine has reported success; calls before that are rejected
     // rather than silently dropped.
@@ -38,27 +46,41 @@ class TtsBridge(messenger: BinaryMessenger, context: Context) {
         engine = TextToSpeech(context) { status ->
             ready = status == TextToSpeech.SUCCESS
             if (ready) attachProgressListener()
-            channel.invokeMethod("ready", ready)
+            send("ready", ready)
+        }
+    }
+
+    private fun send(method: String, argument: Any?) {
+        main.post {
+            if (!released) channel.invokeMethod(method, argument)
         }
     }
 
     private fun attachProgressListener() {
         engine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
-                channel.invokeMethod("speaking", true)
+                send("speaking", true)
             }
 
             override fun onDone(utteranceId: String?) {
-                channel.invokeMethod("speaking", false)
+                send("speaking", false)
+            }
+
+            // Stopping, and replacing one line with the next, both end the
+            // utterance here rather than at onDone. Without this the Dart side
+            // would never learn the engine had finished, and would hold
+            // recognition paused for good.
+            override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                send("speaking", false)
             }
 
             @Deprecated("Required by the base class; the newer overload forwards here.")
             override fun onError(utteranceId: String?) {
-                channel.invokeMethod("speaking", false)
+                send("speaking", false)
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
-                channel.invokeMethod("speaking", false)
+                send("speaking", false)
             }
         })
     }
@@ -104,6 +126,8 @@ class TtsBridge(messenger: BinaryMessenger, context: Context) {
     }
 
     fun release() {
+        released = true
+        main.removeCallbacksAndMessages(null)
         channel.setMethodCallHandler(null)
         engine?.stop()
         engine?.shutdown()

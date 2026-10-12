@@ -8,9 +8,15 @@
         <intent>
             <action android:name="android.speech.RecognitionService" />
         </intent>
+        <!-- Android 11 hides other packages unless they are declared here.
+             Without this the text-to-speech engine cannot be resolved, and
+             reading the transcript aloud fails with nothing to show for it. -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
     </queries>
     <application
-        android:label="live_transcribe"
+        android:label="Live Transcribe"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
