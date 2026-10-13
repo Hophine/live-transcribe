@@ -30,6 +30,10 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // Appended to whatever Flutter and AGP already apply. Without it
+            // R8 strips the ML Kit component registrars and translation fails
+            // at start-up in release builds.
+            proguardFiles("proguard-rules.pro")
         }
     }
 }

@@ -1,11 +1,16 @@
 // Live link between two phones over Wi-Fi.
 //
-// The sending phone runs a small TCP server; receivers connect to it. Messages
-// are newline-delimited JSON, one object per line, so the stream is easy to
-// read from anything - including a plain socket tool on a laptop.
+// One phone hosts a small TCP server; the others join it. Messages are
+// newline-delimited JSON, one object per line, so the stream is easy to read
+// from anything - including a plain socket tool on a laptop.
 //
-// Only the original text travels. Each receiver translates for itself, so two
-// people can listen to the same speaker in different languages.
+// The link runs both ways: everyone joined can speak and everyone hears
+// everyone else. The host relays each guest's words to the other guests, so a
+// three-way conversation works without anyone connecting twice.
+//
+// Only the original text travels, tagged with the language it was spoken in.
+// Each phone translates what arrives into its own language, so two people can
+// follow the same conversation in different languages.
 
 import 'dart:async';
 import 'dart:convert';
@@ -24,22 +29,29 @@ class LinkMessage {
     this.text = '',
     this.lang = '',
     this.seq = 0,
+    this.from = '',
   });
 
   /// One of: hello, partial, final, clear.
   final String kind;
   final String text;
 
-  /// Language the text was spoken in, so the receiver knows what to translate
-  /// from.
+  /// Language the text was spoken in, so whoever receives it knows what to
+  /// translate from.
   final String lang;
   final int seq;
+
+  /// Who said it, so a phone can tell the host apart from the other guests
+  /// and label the conversation. Empty on a message a phone sends about
+  /// itself; filled in by the host when it relays.
+  final String from;
 
   Map<String, Object?> toJson() => {
         't': kind,
         if (text.isNotEmpty) 'text': text,
         if (lang.isNotEmpty) 'lang': lang,
         if (seq != 0) 'seq': seq,
+        if (from.isNotEmpty) 'from': from,
       };
 
   static LinkMessage? parse(String line) {
@@ -54,6 +66,7 @@ class LinkMessage {
         text: data['text'] as String? ?? '',
         lang: data['lang'] as String? ?? '',
         seq: (data['seq'] as num?)?.toInt() ?? 0,
+        from: data['from'] as String? ?? '',
       );
     } catch (_) {
       return null;
@@ -61,34 +74,81 @@ class LinkMessage {
   }
 }
 
-/// Serves the transcript to any number of receivers.
+/// Hosts the conversation: serves what this phone hears to everyone joined,
+/// and passes on what they say in return.
 class LinkServer {
   ServerSocket? _server;
   final List<Socket> _clients = [];
 
+  /// Name shown for each guest, so lines arriving from two different phones
+  /// are not run together. Kept per socket and dropped when it disconnects.
+  final Map<Socket, String> _names = {};
+
+  /// Guests numbered in the order they first joined. Never reused, so a guest
+  /// that drops and returns does not take over the earlier one's lines.
+  int _joined = 0;
+
   final StreamController<int> _clientCounts =
       StreamController<int>.broadcast();
   final StreamController<String> _errors = StreamController<String>.broadcast();
+  final StreamController<LinkMessage> _inbound =
+      StreamController<LinkMessage>.broadcast();
 
   int _seq = 0;
+
+  /// Language this phone is speaking, sent in the greeting so a guest knows
+  /// what to translate from before anyone says anything. Kept here rather
+  /// than captured at start-up so a later language change still reaches
+  /// whoever joins next.
+  String _lang = '';
 
   bool get running => _server != null;
   int get clientCount => _clients.length;
 
-  /// Fires whenever a receiver connects or drops.
+  /// Fires whenever a guest connects or drops.
   Stream<int> get clientCounts => _clientCounts.stream;
   Stream<String> get errors => _errors.stream;
 
-  /// Addresses a receiver can be pointed at. A phone usually has one Wi-Fi
-  /// address; a hotspot adds another.
+  /// What the guests say, tagged with who said it.
+  Stream<LinkMessage> get inbound => _inbound.stream;
+
+  /// Addresses a guest can be pointed at, best first.
+  ///
+  /// A phone with mobile data has an address on that interface too, and
+  /// another phone cannot route to it. Showing that one first sends people to
+  /// an address that times out, so Wi-Fi and hotspot interfaces come first and
+  /// mobile ones are dropped entirely.
   Future<List<String>> localAddresses() async {
     try {
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
         includeLoopback: false,
       );
+
+      int rank(String name) {
+        final lower = name.toLowerCase();
+        if (lower.startsWith('wlan')) return 0; // Joined a Wi-Fi network.
+        if (lower.startsWith('ap') || lower.startsWith('swlan')) {
+          return 1; // This phone is the hotspot.
+        }
+        return 2;
+      }
+
+      // rmnet/ccmni are the mobile data interfaces; unreachable from another
+      // phone, so they are not offered at all.
+      bool isMobile(String name) {
+        final lower = name.toLowerCase();
+        return lower.startsWith('rmnet') ||
+            lower.startsWith('ccmni') ||
+            lower.startsWith('pdp') ||
+            lower.startsWith('clat');
+      }
+
+      final usable = interfaces.where((i) => !isMobile(i.name)).toList()
+        ..sort((a, b) => rank(a.name).compareTo(rank(b.name)));
+
       return [
-        for (final interface in interfaces)
+        for (final interface in usable)
           for (final address in interface.addresses) address.address,
       ];
     } on SocketException {
@@ -96,19 +156,27 @@ class LinkServer {
     }
   }
 
+  /// Tells the host's guests which language it has switched to.
+  void setLanguage(String lang) {
+    if (lang == _lang) return;
+    _lang = lang;
+    if (_clients.isNotEmpty) _broadcast(LinkMessage(kind: 'hello', lang: lang));
+  }
+
   Future<bool> start({String lang = ''}) async {
     if (_server != null) return true;
+    _lang = lang;
     try {
       // anyIPv4 so both Wi-Fi and a USB forward can reach it.
       final server = await ServerSocket.bind(InternetAddress.anyIPv4, linkPort);
       _server = server;
       server.listen(
-        (socket) => _accept(socket, lang),
-        onError: (Object error) => _errors.add('Link error: $error'),
+        _accept,
+        onError: (Object error) => _report('Link error: $error'),
       );
       return true;
     } on SocketException catch (error) {
-      _errors.add(
+      _report(
         error.osError?.errorCode == 98 || error.osError?.errorCode == 10048
             ? 'Port $linkPort is already in use.'
             : 'Could not start the link: ${error.message}',
@@ -117,28 +185,61 @@ class LinkServer {
     }
   }
 
-  void _accept(Socket socket, String lang) {
+  void _accept(Socket socket) {
     socket.setOption(SocketOption.tcpNoDelay, true);
     _clients.add(socket);
-    _clientCounts.add(_clients.length);
-    // Greet so the receiver can show it is connected before anyone speaks.
-    _writeTo(socket, LinkMessage(kind: 'hello', lang: lang));
-    socket.listen(
-      (_) {}, // Receivers never send anything; ignore whatever arrives.
-      onDone: () => _drop(socket),
-      onError: (Object _) => _drop(socket),
-      cancelOnError: true,
+    _names[socket] = 'Guest ${++_joined}';
+    _notifyCount();
+    // Greet so the guest can show it is connected before anyone speaks.
+    _writeTo(socket, LinkMessage(kind: 'hello', lang: _lang));
+    socket
+        .cast<List<int>>()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen(
+          (line) => _onLine(socket, line),
+          onDone: () => _drop(socket),
+          onError: (Object _) => _drop(socket),
+          cancelOnError: true,
+        );
+  }
+
+  /// A guest spoke. Report it to this phone and pass it on to the other
+  /// guests, so everyone joined hears everyone else rather than only the host.
+  void _onLine(Socket socket, String line) {
+    final message = LinkMessage.parse(line);
+    if (message == null) return;
+    final stamped = LinkMessage(
+      kind: message.kind,
+      text: message.text,
+      lang: message.lang,
+      seq: message.seq,
+      // Trust the host's own naming over whatever the guest claims to be.
+      from: _names[socket] ?? 'Guest',
     );
+    if (!_inbound.isClosed) _inbound.add(stamped);
+    for (final other in List<Socket>.from(_clients)) {
+      if (other != socket) _writeTo(other, stamped);
+    }
   }
 
   void _drop(Socket socket) {
+    _names.remove(socket);
     if (!_clients.remove(socket)) return;
-    _clientCounts.add(_clients.length);
+    _notifyCount();
     try {
       socket.destroy();
     } catch (_) {
       // Already gone.
     }
+  }
+
+  void _notifyCount() {
+    if (!_clientCounts.isClosed) _clientCounts.add(_clients.length);
+  }
+
+  void _report(String message) {
+    if (!_errors.isClosed) _errors.add(message);
   }
 
   void _writeTo(Socket socket, LinkMessage message) {
@@ -188,13 +289,15 @@ class LinkServer {
     await stop();
     await _clientCounts.close();
     await _errors.close();
+    await _inbound.close();
   }
 }
 
 /// How the receiving end is doing.
 enum LinkState { idle, connecting, connected, failed }
 
-/// Connects to a sending phone and reports what it says.
+/// Joins a hosted conversation: reports what the others say, and sends back
+/// what this phone hears.
 class LinkClient {
   Socket? _socket;
   StreamSubscription<String>? _lines;
@@ -213,6 +316,17 @@ class LinkClient {
   LinkState _state = LinkState.idle;
   String? _detail;
 
+  int _seq = 0;
+
+  /// Language this phone is speaking. Sent as a greeting the moment a
+  /// connection comes up, so the host knows what to translate from before
+  /// anything is said - and again after a reconnect, which the retry loop
+  /// does on its own.
+  String _lang = '';
+
+  /// True while there is a live socket to speak into.
+  bool get connected => _state == LinkState.connected && _socket != null;
+
   LinkState get state => _state;
   String? get detail => _detail;
   String? get host => _host;
@@ -228,11 +342,19 @@ class LinkClient {
 
   /// Starts connecting and keeps trying until [disconnect] is called, so the
   /// receiver survives the sender being started afterwards.
-  Future<void> connect(String host) async {
+  Future<void> connect(String host, {String lang = ''}) async {
     _host = host.trim();
     _wanted = true;
     _attempts = 0;
+    if (lang.isNotEmpty) _lang = lang;
     await _attempt();
+  }
+
+  /// Tells the host which language this phone has switched to.
+  void setLanguage(String lang) {
+    if (lang == _lang) return;
+    _lang = lang;
+    if (connected) _send(LinkMessage(kind: 'hello', lang: lang));
   }
 
   Future<void> _attempt() async {
@@ -258,6 +380,9 @@ class LinkClient {
       _socket = socket;
       _attempts = 0;
       _setState(LinkState.connected, 'Connected to $host');
+      // Greet first so the host can prepare translation for this phone's
+      // language before the first sentence arrives.
+      if (_lang.isNotEmpty) _send(LinkMessage(kind: 'hello', lang: _lang));
       _lines = socket
           .cast<List<int>>()
           .transform(utf8.decoder)
@@ -275,6 +400,33 @@ class LinkClient {
       _setState(LinkState.failed, 'No answer from $host.');
       _scheduleRetry();
     }
+  }
+
+  void _send(LinkMessage message) {
+    final socket = _socket;
+    if (socket == null) return;
+    try {
+      socket.write('${jsonEncode(message.toJson())}\n');
+    } catch (_) {
+      // The socket is gone; the retry loop will notice and reconnect.
+    }
+  }
+
+  /// Words still being recognised on this phone, so the far end sees the
+  /// sentence forming instead of waiting for the whole thing.
+  void sendPartial(String text, String lang) {
+    if (!connected) return;
+    _send(LinkMessage(kind: 'partial', text: text, lang: lang));
+  }
+
+  void sendFinal(String text, String lang) {
+    if (!connected) return;
+    _send(LinkMessage(kind: 'final', text: text, lang: lang, seq: ++_seq));
+  }
+
+  void sendClear() {
+    if (!connected) return;
+    _send(const LinkMessage(kind: 'clear'));
   }
 
   void _onLine(String line) {

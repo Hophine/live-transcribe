@@ -45,6 +45,12 @@ class Translator {
 
   TranslationStatus _status = const TranslationStatus(TranslationStage.off);
 
+  /// Bumped on every [setPair] call. Downloading a model takes a while, and a
+  /// second call in the meantime must win: without this the slower of two
+  /// overlapping calls would install its translator last and leave the pair
+  /// pointing at a language the user has already moved off.
+  int _generation = 0;
+
   TranslationStatus get status => _status;
   Stream<TranslationStatus> get statuses => _statuses.stream;
 
@@ -76,6 +82,7 @@ class Translator {
   }) async {
     final from = languageFor(fromCode);
     final to = toCode == null ? null : languageFor(toCode);
+    final generation = ++_generation;
 
     if (to == null || from == null || from == to) {
       await _disposeTranslator();
@@ -100,12 +107,14 @@ class Translator {
       for (final language in [from, to]) {
         final code = language.bcpCode;
         final present = await _modelManager.isModelDownloaded(code);
+        if (generation != _generation) return;
         if (!present) {
           _emit(TranslationStatus(
             TranslationStage.downloading,
             detail: 'Downloading $code language pack…',
           ));
           await _modelManager.downloadModel(code, isWifiRequired: false);
+          if (generation != _generation) return;
         }
       }
       _translator = OnDeviceTranslator(
@@ -113,7 +122,8 @@ class Translator {
         targetLanguage: to,
       );
       _emit(const TranslationStatus(TranslationStage.ready));
-    } catch (error) {
+    } catch (_) {
+      if (generation != _generation) return;
       _translator = null;
       _emit(TranslationStatus(
         TranslationStage.failed,
